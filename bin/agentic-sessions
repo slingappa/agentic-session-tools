@@ -1106,13 +1106,16 @@ def command_resume(args: argparse.Namespace) -> int:
         configs, args.selector, args.match_limit, include_generated=include_generated_sessions(args)
     )
     agent_bin = agent_bin_for(args, session.provider)
-    command = resume_command(session.provider, agent_bin, session.id)
+    commands = resume_commands(session.provider, agent_bin, session.id)
     if args.print_command:
         print(resume_shell_command(session, agent_bin))
         return 0
     if session.cwd:
         os.chdir(session.cwd)
-    os.execvp(command[0], command)
+    if len(commands) == 1:
+        command = commands[0]
+        os.execvp(command[0], command)
+    os.execvp("sh", ["sh", "-c", shell_command(commands)])
     return 127
 
 
@@ -1245,18 +1248,28 @@ def is_qgenie_bin(agent_bin: str) -> bool:
     return Path(agent_bin).name == "qgenie"
 
 
-def resume_command(provider: str, agent_bin: str, session_id: str) -> list[str]:
+def resume_commands(provider: str, agent_bin: str, session_id: str) -> list[list[str]]:
     if is_qgenie_bin(agent_bin):
         if provider == "claude":
-            return [agent_bin, "claude", "--resume", session_id]
-        return [agent_bin, "codex", "resume", session_id]
+            return [[agent_bin, "claude", "--resume", session_id]]
+        return [[agent_bin, "codex", "resume", session_id], [agent_bin, "resume", session_id]]
     if provider == "claude":
-        return [agent_bin, "--resume", session_id]
-    return [agent_bin, "resume", session_id]
+        return [[agent_bin, "--resume", session_id]]
+    return [[agent_bin, "resume", session_id]]
+
+
+def resume_command(provider: str, agent_bin: str, session_id: str) -> list[str]:
+    return resume_commands(provider, agent_bin, session_id)[0]
+
+
+def shell_command(commands: Sequence[Sequence[str]]) -> str:
+    return " || ".join(" ".join(shell_quote(part) for part in command) for command in commands)
 
 
 def resume_shell_command(session: Session, agent_bin: str) -> str:
-    command = " ".join(shell_quote(part) for part in resume_command(session.provider, agent_bin, session.id))
+    command = shell_command(resume_commands(session.provider, agent_bin, session.id))
+    if " || " in command:
+        command = "(" + command + ")"
     if session.cwd:
         return "cd " + shell_quote(session.cwd) + " && " + command
     return command
@@ -1386,7 +1399,8 @@ def ensure_tmux_status_segment(
         except Exception:
             current = ""
     if marker not in current:
-        run_tmux(["set-option", "-q", original_marker, current], dry_run)
+        if current:
+            run_tmux(["set-option", "-q", original_marker, current], dry_run)
         separator = " " if current else ""
         updated = current + separator + segment if append else segment + separator + current
         run_tmux(["set-option", "-q", option_name, updated], dry_run)
