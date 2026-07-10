@@ -1249,7 +1249,7 @@ def resume_command(provider: str, agent_bin: str, session_id: str) -> list[str]:
     if is_qgenie_bin(agent_bin):
         if provider == "claude":
             return [agent_bin, "claude", "--resume", session_id]
-        return [agent_bin, "codex", "resume", session_id]
+        return [agent_bin, "resume", session_id]
     if provider == "claude":
         return [agent_bin, "--resume", session_id]
     return [agent_bin, "resume", session_id]
@@ -1386,7 +1386,8 @@ def ensure_tmux_status_segment(
         except Exception:
             current = ""
     if marker not in current:
-        run_tmux(["set-option", "-q", original_marker, current], dry_run)
+        if current:
+            run_tmux(["set-option", "-q", original_marker, current], dry_run)
         separator = " " if current else ""
         updated = current + separator + segment if append else segment + separator + current
         run_tmux(["set-option", "-q", option_name, updated], dry_run)

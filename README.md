@@ -160,8 +160,7 @@ export CLAUDE_BIN=/absolute/path/to/claude
 `CODEX_BIN` and `CLAUDE_BIN` are intentionally generic: they may point to the real
 CLI or a compatible wrapper executable. The tool does not hardcode wrapper names.
 When either variable points at the `qgenie` executable, resume commands are sent
-through QGenie's native passthrough form, for example `qgenie codex resume <id>`
-or `qgenie claude --resume <id>`.
+through QGenie's native Codex-compatible form, for example `qgenie resume <id>`.
 
 For wrappers using `script`, common Linux argument order is:
 
@@ -366,8 +365,8 @@ agentic-sessions resume <id> --print-command
 ```
 
 It should print an absolute Codex path when Codex is installed in `~/.local/bin`.
-If `CODEX_BIN` points at QGenie, it should print `qgenie codex resume <id>`, not
-`qgenie resume <id>`.
+If `CODEX_BIN` points at QGenie, it should print `qgenie resume <id>`, not
+`qgenie codex resume <id>`.
 If not, set:
 
 ```bash
