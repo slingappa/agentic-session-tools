@@ -109,6 +109,7 @@ For machine-local defaults without changing your shell rc, create an ignored loc
 cat > .agentic-session-tools.env <<'EOF'
 CODEX_HOME=/absolute/path/to/codex-home-or-agent
 CODEX_BIN=/absolute/path/to/codex-or-compatible-wrapper
+CODEX_ARGS=-s danger-full-access
 CLAUDE_CONFIG_DIR=/absolute/path/to/claude-config
 CLAUDE_BIN=/absolute/path/to/claude-or-compatible-wrapper
 EOF
@@ -154,6 +155,7 @@ common install locations. If the wrong executable is selected, set:
 
 ```bash
 export CODEX_BIN=/absolute/path/to/codex
+export CODEX_ARGS="-s danger-full-access"
 export CLAUDE_BIN=/absolute/path/to/claude
 ```
 
@@ -161,8 +163,10 @@ export CLAUDE_BIN=/absolute/path/to/claude
 CLI or a compatible wrapper executable. The tool does not hardcode wrapper names.
 When either variable points at the `qgenie` executable, Claude resumes use
 `qgenie claude --resume <id>`. Codex resumes try the provider-qualified
-`qgenie codex resume <id>` form first and fall back to the older
-`qgenie resume <id>` form for legacy QGenie setups.
+`qgenie codex <CODEX_ARGS> resume <id>` form first and fall back to the older
+`qgenie resume <id>` form for legacy QGenie setups. Use `CODEX_ARGS` or
+`--codex-args` for options that would normally live in an alias such as
+`qgenie codex -s danger-full-access`.
 
 For wrappers using `script`, common Linux argument order is:
 
@@ -218,6 +222,12 @@ agentic-sessions resume "RPMI telemetry"
 agentic-sessions --provider claude resume 5656cd9d
 ```
 
+Resume reuses an existing matching process when possible: it foregrounds a
+stopped process, focuses or attaches to its tmux pane, and only stops an
+unreachable orphan before starting a clean resume. Use
+`--no-recover-existing` to preserve the provider's single-writer error instead
+of recovering automatically.
+
 Claude Code resume is run from the session's saved working directory because
 Claude stores resumable conversations in project-scoped history.
 
@@ -261,7 +271,8 @@ Sidebar behavior:
 - `r` stages `/rename <current-name>` in the right pane only for the active resumed session; edit there and press `Enter` yourself.
 - Prompt context is never used as a rename default. Staging rename pauses background scanning; press `R` after submitting if you want native names reloaded.
 - Sessions load newest-first in chunks for fast first paint and cached navigation. Search, clear, delete, and `R` reload.
-- Prefix + `b` reopens the sidebar. Prefix + `?` shows help from either pane. The tmux status bar keeps these hints visible after the sidebar closes.
+- Prefix + `b` reopens the sidebar. Prefix + `?` shows help from either pane. The tmux status bar keeps the workspace title visible after the sidebar closes.
+- When `qgenie` is available, the tmux status bar shows compact Daily and Monthly cost-cap numbers followed by the full pane shortcuts (for example, ``D 4.2% $10.39/$250 · M 80.8% $1010.40/$1250  `+? keys `+b sidebar `+←/→ panes mouse focus``). The value is refreshed at most once per minute and keeps the last successful value during a transient CLI failure. Set `QGENIE_BIN` when the executable is not discoverable.
 - Switching sessions suspends the current right-pane agent with `Ctrl-Z`; use `jobs`/`fg` there if needed.
 
 ## Optional tmux Configuration
@@ -341,6 +352,7 @@ Environment variables:
 - `AGENTIC_SESSION_PROVIDER`: default provider list, for example `codex`, `claude`, or `codex,claude`; default is `codex,claude`
 - `CODEX_SESSION_PROVIDER`: legacy default-provider variable, still honored
 - `CODEX_BIN`: explicit Codex binary path
+- `QGENIE_BIN`: optional qgenie executable path used for the tmux cost-cap status segment
 - `CODEX_HOME`: agent home containing `sessions/`, or CLI home containing `agent/sessions/`
 - `CODEX_SESSIONS_ROOT`: explicit rollout JSONL session root; overrides `CODEX_HOME`
 - `AGENTIC_SESSION_TOOLS_HOME`: sidecar metadata root for both providers
@@ -368,11 +380,12 @@ agentic-sessions resume <id> --print-command
 
 It should print an absolute Codex path when Codex is installed in `~/.local/bin`.
 If `CODEX_BIN` points at QGenie, it should print a fallback command containing
-both `qgenie codex resume <id>` and `qgenie resume <id>`.
+both `qgenie codex <CODEX_ARGS> resume <id>` and `qgenie resume <id>`.
 If not, set:
 
 ```bash
 export CODEX_BIN=/absolute/path/to/codex
+export CODEX_ARGS="-s danger-full-access"
 ```
 
 For Claude sessions, use:
@@ -392,10 +405,26 @@ without reparsing JSONL on every keypress. Press `R` to refresh manually.
 Use the latest version. Inside tmux, `agentic-sessions tmux` should split the current
 window, not create a new window.
 
+### tmux reports that no current pane or server exists
+
+If a shell retains `TMUX` after its tmux server was stopped, the latest version
+detects the stale context and starts a detached workspace instead of raising a
+traceback. Reinstall the tool if the traceback points at an older copy under
+`~/.local/bin`.
+
 ### I am stuck at Codex's working-directory prompt
 
 Move to the right pane with your tmux prefix + arrow key, or restart with the latest
 tool version. Current versions automatically focus the right pane after `Enter`.
+
+### Codex says the conversation is open in another app
+
+The resume command checks the provider's thread-writer lock before launching.
+If the owner is in a live or detached tmux pane, it focuses or attaches to that
+pane. If the pane disappeared, it gracefully stops only the matching orphaned
+Codex/QGenie process and retries the resume. To preserve the original behavior,
+use `--no-recover-existing`; do not delete a lock file while its process still
+holds it.
 
 ### Session list is missing expected sessions
 

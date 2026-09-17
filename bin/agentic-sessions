@@ -11,9 +11,12 @@ from __future__ import annotations
 import argparse
 import curses
 import datetime as dt
+import hashlib
 import json
 import os
 import re
+import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,6 +30,11 @@ from typing import Iterable, Sequence
 
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])")
+QGENIE_LIMIT_RE = re.compile(
+    r"^\s*(Daily|Monthly)\s+.*?\b(\d+(?:\.\d+)?)%\s+"
+    r"\(\s*\$([\d,]+(?:\.\d+)?)\s*/\s*\$([\d,]+(?:\.\d+)?)\s*\)"
 )
 SUPPORTED_PROVIDERS = ("codex", "claude")
 
@@ -68,6 +76,26 @@ class Session:
         if self.cwd:
             return Path(self.cwd).name or self.cwd
         return self.id
+
+
+@dataclass
+class ProcessInfo:
+    pid: int
+    ppid: int
+    pgid: int
+    tty: str
+    state: str
+    cmdline: tuple[str, ...]
+
+
+@dataclass
+class TmuxPane:
+    pane_id: str
+    pane_pid: int
+    tty: str
+    session: str
+    window: str
+    attached: bool
 
 
 def eprint(*args: object) -> None:
@@ -742,6 +770,7 @@ def light_session_from_path(config: Config, path: Path, names: dict) -> Session 
 
 def load_session_index(config: Config, query: str = "", limit: int = 0, include_generated: bool = False) -> list[Session]:
     names = load_title_metadata(config)
+    needle = query.lower()
     sessions: list[Session] = []
     for path in session_files(config):
         if not include_session_path(config, path, include_generated=include_generated):
@@ -749,7 +778,11 @@ def load_session_index(config: Config, query: str = "", limit: int = 0, include_
         session = light_session_from_path(config, path, names)
         if not session:
             continue
-        if query and query.lower() not in session_haystack(session):
+        if needle and needle not in session_haystack(session):
+            parsed = parse_session(path, names, config.provider, fast_sidebar=True)
+            if parsed:
+                session = parsed
+        if needle and needle not in session_haystack(session):
             continue
         sessions.append(session)
         if limit and len(sessions) >= limit:
@@ -805,9 +838,21 @@ class SidebarIndexLoader:
             key = session_name_key(session.provider, session.id)
             if key in self.seen:
                 continue
-            self.seen.add(key)
+            if self.query and self.query not in session_haystack(session):
+                parsed = parse_session(
+                    path,
+                    self.names_by_provider.get(config.provider, {}),
+                    config.provider,
+                    fast_sidebar=True,
+                )
+                if parsed:
+                    session = parsed
+                    key = session_name_key(session.provider, session.id)
+                    if key in self.seen:
+                        continue
             if self.query and self.query not in session_haystack(session):
                 continue
+            self.seen.add(key)
             added.append(session)
         if self.index >= len(self.pending):
             self.done = True
@@ -1106,9 +1151,18 @@ def command_resume(args: argparse.Namespace) -> int:
         configs, args.selector, args.match_limit, include_generated=include_generated_sessions(args)
     )
     agent_bin = agent_bin_for(args, session.provider)
-    commands = resume_commands(session.provider, agent_bin, session.id)
+    codex_args = codex_args_for(args) if session.provider == "codex" else []
+    commands = resume_commands(session.provider, agent_bin, session.id, codex_args)
     if args.print_command:
-        print(resume_shell_command(session, agent_bin))
+        print(resume_shell_command(session, agent_bin, codex_args))
+        return 0
+    config = config_for_provider(configs, session.provider)
+    handled, recovery_message = recover_existing_session(
+        session, config, allow_terminate=not getattr(args, "no_recover_existing", False)
+    )
+    if recovery_message:
+        eprint(recovery_message)
+    if handled:
         return 0
     if session.cwd:
         os.chdir(session.cwd)
@@ -1178,6 +1232,17 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if core_ok else 1
 
 
+def command_qgenie_status(args: argparse.Namespace) -> int:
+    status = qgenie_limits_status(
+        args.qgenie_bin,
+        cache_ttl=args.cache_ttl,
+        cache_path=Path(args.cache_path).expanduser() if args.cache_path else None,
+    )
+    if status:
+        print(status)
+    return 0
+
+
 def ensure_tmux() -> str:
     tmux = shutil.which("tmux")
     if not tmux:
@@ -1185,8 +1250,379 @@ def ensure_tmux() -> str:
     return tmux
 
 
+def current_tmux_pane() -> str:
+    """Return the pane running this command, or ``""`` outside tmux.
+
+    ``TMUX`` can survive after its server/socket has gone away (for example
+    when a shell is reused after a tmux session was killed).  Treat that as
+    an ordinary non-tmux invocation instead of allowing a failed
+    ``display-message`` probe to raise a traceback.  Prefer ``TMUX_PANE`` so
+    this also works for commands launched from a detached client or a
+    tmux ``run-shell`` hook, where there may be no current client.
+    """
+    if not os.environ.get("TMUX"):
+        return ""
+
+    targets: list[str | None] = []
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    if pane:
+        targets.append(pane)
+    targets.append(None)
+    tried: set[str | None] = set()
+    for target in targets:
+        if target in tried:
+            continue
+        tried.add(target)
+        command = ["tmux", "display-message", "-p"]
+        if target:
+            command.extend(["-t", target])
+        command.append("#{pane_id}")
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                check=False,
+                capture_output=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        current = (result.stdout or "").strip()
+        if result.returncode == 0 and current.startswith("%"):
+            return current
+    return ""
+
+
+def tmux_server_available() -> bool:
+    """Return whether the socket selected by ``TMUX`` has a live server."""
+    if not os.environ.get("TMUX"):
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions"],
+            text=True,
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+def strip_terminal_sequences(value: str) -> str:
+    """Remove ANSI colors and OSC hyperlinks from a CLI status response."""
+    return ANSI_ESCAPE_RE.sub("", value).replace("\r", "")
+
+
+def _compact_money(value: str) -> str:
+    value = value.replace(",", "")
+    if "." in value:
+        whole, fraction = value.split(".", 1)
+        return whole if fraction and not fraction.strip("0") else f"{whole}.{fraction}"
+    return value
+
+
+def parse_qgenie_limits(output: str) -> dict[str, tuple[str, str, str]]:
+    """Return ``period -> (percent, spent, cap)`` from ``qgenie limits``."""
+    limits: dict[str, tuple[str, str, str]] = {}
+    for line in strip_terminal_sequences(output).splitlines():
+        match = QGENIE_LIMIT_RE.search(line)
+        if not match:
+            continue
+        period, percent, spent, cap = match.groups()
+        limits[period] = (percent, _compact_money(spent), _compact_money(cap))
+    return limits
+
+
+def format_qgenie_limits(output: str) -> str:
+    """Format qgenie usage compactly enough for a tmux status-right segment."""
+    limits = parse_qgenie_limits(output)
+    parts = []
+    for period, label in (("Daily", "D"), ("Monthly", "M")):
+        values = limits.get(period)
+        if values:
+            percent, spent, cap = values
+            parts.append(f"{label} {percent}% ${spent}/${cap}")
+    return "Qgenie " + " · ".join(parts) if parts else ""
+
+
+def qgenie_limits_cache_path(qgenie_bin: str) -> Path:
+    cache_dir = Path(os.environ.get("TMPDIR") or "/tmp")
+    identity = hashlib.sha256(str(Path(qgenie_bin).expanduser()).encode()).hexdigest()[:12]
+    uid = getattr(os, "getuid", lambda: 0)()
+    return cache_dir / f"agentic-sessions-qgenie-limits-{uid}-{identity}.txt"
+
+
+def qgenie_limits_status(
+    qgenie_bin: str,
+    *,
+    cache_ttl: float = 60.0,
+    cache_path: Path | None = None,
+) -> str:
+    """Fetch and cache qgenie limits for tmux's short-lived ``#()`` jobs."""
+    if not qgenie_bin:
+        return ""
+    cache_path = cache_path or qgenie_limits_cache_path(qgenie_bin)
+    cached = ""
+    try:
+        cached = cache_path.read_text(errors="replace").strip()
+        if cache_path.stat().st_mtime >= time.time() - max(0.0, cache_ttl) and cached:
+            return cached
+    except OSError:
+        pass
+    try:
+        env = os.environ.copy()
+        env["TERM"] = "dumb"
+        result = subprocess.run(
+            [qgenie_bin, "limits"],
+            text=True,
+            check=False,
+            capture_output=True,
+            timeout=10,
+            env=env,
+        )
+        formatted = format_qgenie_limits((result.stdout or "") + (result.stderr or ""))
+    except (OSError, subprocess.SubprocessError):
+        formatted = ""
+    if formatted:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+            temporary.write_text(formatted + "\n")
+            os.replace(temporary, cache_path)
+        except OSError:
+            pass
+        return formatted
+    if cached:
+        # Avoid retrying a failed remote call on every tmux status tick while
+        # retaining the last known value for the next minute.
+        try:
+            os.utime(cache_path, None)
+        except OSError:
+            pass
+    return cached
+
+
+def read_process_info(pid: int) -> ProcessInfo | None:
+    proc = Path("/proc") / str(pid)
+    try:
+        raw_cmdline = (proc / "cmdline").read_bytes().split(b"\0")
+        cmdline = tuple(part.decode(errors="replace") for part in raw_cmdline if part)
+        status_lines = (proc / "status").read_text(errors="replace").splitlines()
+        status = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in status_lines if ":" in line}
+        ppid = int(status.get("PPid", "0"))
+        state = status.get("State", "?")[:1]
+        tty = os.readlink(proc / "fd" / "0")
+        pgid = os.getpgid(pid)
+    except (OSError, ValueError):
+        return None
+    if not cmdline:
+        return None
+    return ProcessInfo(pid, ppid, pgid, tty, state, cmdline)
+
+
+def session_processes(session_id: str) -> list[ProcessInfo]:
+    processes: list[ProcessInfo] = []
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return processes
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        info = read_process_info(int(entry.name))
+        if info and session_id in info.cmdline and any(
+            token == "qgenie" or "codex" in Path(token).name or "claude" in Path(token).name
+            for token in info.cmdline
+        ):
+            processes.append(info)
+    return processes
+
+
+def lock_holders(lock_path: Path, session_id: str) -> list[ProcessInfo]:
+    lock_name = str(lock_path)
+    holders: list[ProcessInfo] = []
+    for info in session_processes(session_id):
+        fd_root = Path("/proc") / str(info.pid) / "fd"
+        try:
+            fds = list(fd_root.iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if target == lock_name or target == lock_name + " (deleted)":
+                holders.append(info)
+                break
+    return holders
+
+
+def tmux_panes() -> list[TmuxPane]:
+    format_string = "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{session_name}\t#{window_index}\t#{session_attached}"
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", format_string],
+            text=True,
+            check=False,
+            capture_output=True,
+        )
+    except OSError:
+        return []
+    if result.returncode:
+        return []
+    panes: list[TmuxPane] = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        try:
+            pane_pid = int(fields[1])
+        except ValueError:
+            continue
+        panes.append(TmuxPane(fields[0], pane_pid, fields[2], fields[3], fields[4], fields[5] == "1"))
+    return panes
+
+
+def pane_for_process(info: ProcessInfo, panes: Sequence[TmuxPane] | None = None) -> TmuxPane | None:
+    panes = list(panes if panes is not None else tmux_panes())
+    # The controlling tty is the most reliable match, including when the pane
+    # process is a shell and Codex is several descendants below it.
+    for pane in panes:
+        if pane.tty == info.tty:
+            return pane
+    ancestors = {info.pid}
+    current = info
+    for _ in range(32):
+        if current.ppid <= 1 or current.ppid in ancestors:
+            break
+        ancestors.add(current.ppid)
+        parent = read_process_info(current.ppid)
+        if not parent:
+            break
+        current = parent
+    for pane in panes:
+        if pane.pane_pid in ancestors:
+            return pane
+    return None
+
+
+def focus_tmux_pane(pane: TmuxPane) -> bool:
+    target = f"{pane.session}:{pane.window}"
+    if os.environ.get("TMUX"):
+        subprocess.run(["tmux", "switch-client", "-t", target], check=False)
+        subprocess.run(["tmux", "select-pane", "-t", pane.pane_id], check=False)
+        return True
+    result = subprocess.run(["tmux", "attach-session", "-t", pane.session], check=False)
+    return result.returncode == 0
+
+
+def foreground_stopped_process(pane: TmuxPane) -> None:
+    subprocess.run(["tmux", "send-keys", "-t", pane.pane_id, "fg", "Enter"], check=False)
+    subprocess.run(["tmux", "select-pane", "-t", pane.pane_id], check=False)
+
+
+def process_alive(pid: int) -> bool:
+    info = read_process_info(pid)
+    if info is not None:
+        return info.state != "Z"
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def stop_existing_session_processes(processes: Sequence[ProcessInfo], timeout: float = 2.0) -> bool:
+    """Gracefully stop matching Codex/QGenie processes before a fresh resume.
+
+    Only processes whose command line contains the selected session id are
+    passed here; the shell that launched them is deliberately left alone.
+    """
+    unique = {info.pid: info for info in processes}
+    for info in sorted(unique.values(), key=lambda item: item.pid, reverse=True):
+        try:
+            os.kill(info.pid, signal.SIGINT)
+        except OSError:
+            pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(process_alive(info.pid) for info in unique.values()):
+            return True
+        time.sleep(0.1)
+    for info in sorted(unique.values(), key=lambda item: item.pid, reverse=True):
+        if process_alive(info.pid):
+            try:
+                os.kill(info.pid, signal.SIGTERM)
+            except OSError:
+                pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(process_alive(info.pid) for info in unique.values()):
+            return True
+        time.sleep(0.1)
+    # An unreachable process can be stuck in native code and ignore both
+    # interactive interrupt and SIGTERM. These PIDs were discovered from the
+    # selected session's lock/cmdline, so SIGKILL is the final recovery step.
+    for info in sorted(unique.values(), key=lambda item: item.pid, reverse=True):
+        current = read_process_info(info.pid)
+        if current and info.cmdline == current.cmdline:
+            try:
+                os.kill(info.pid, signal.SIGKILL)
+            except OSError:
+                pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(process_alive(info.pid) for info in unique.values()):
+            return True
+        time.sleep(0.1)
+    return not any(process_alive(info.pid) for info in unique.values())
+
+
+def recover_existing_session(
+    session: Session,
+    config: Config,
+    *,
+    allow_terminate: bool = True,
+) -> tuple[bool, str]:
+    """Reuse an existing session process, or clear an unreachable owner.
+
+    Returns ``(True, message)`` when the caller should not launch another
+    process. An owner in a live tmux pane is focused/foregrounded. An owner
+    whose pane disappeared is stopped gracefully so the caller can launch a
+    clean resume; this is the only safe fallback when no PTY-transfer helper
+    is available.
+    """
+    lock_path = config.agent_home / "thread-writer-locks" / f"{session.id}.lock"
+    holders = lock_holders(lock_path, session.id)
+    if not holders:
+        return False, ""
+    panes = tmux_panes()
+    owner = holders[0]
+    pane = pane_for_process(owner, panes)
+    if pane:
+        if owner.state in {"T", "t"}:
+            foreground_stopped_process(pane)
+            focus_tmux_pane(pane)
+            return True, f"foregrounded existing {session.id[:12]}"
+        focus_tmux_pane(pane)
+        return True, f"focused existing {session.id[:12]}"
+    if not allow_terminate:
+        return True, f"session {session.id[:12]} is already running (pid {owner.pid}, tty {owner.tty})"
+    # A second resume attempt may already be running in another pane. Only
+    # clear the unreachable owner's process group; never disturb a live pane
+    # for the same conversation.
+    processes = [info for info in session_processes(session.id) if info.pgid == owner.pgid]
+    if not processes:
+        processes = [owner]
+    if not stop_existing_session_processes(processes):
+        return True, f"could not stop unreachable process for {session.id[:12]} (pid {owner.pid})"
+    return False, f"cleared unreachable process for {session.id[:12]}"
 
 
 def command_is_available(command: str) -> bool:
@@ -1217,6 +1653,31 @@ def default_codex_bin() -> str:
     return "codex"
 
 
+def default_qgenie_bin() -> str:
+    configured = os.environ.get("QGENIE_BIN")
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.parent != Path(".") or configured.startswith("~"):
+            return str(candidate) if candidate.exists() and os.access(candidate, os.X_OK) else ""
+        return configured if shutil.which(configured) else ""
+    path_bin = shutil.which("qgenie")
+    if path_bin:
+        return path_bin
+    candidates = [
+        Path.home() / ".local" / "bin" / "qgenie",
+        Path("/usr/local/bin/qgenie"),
+        Path("/opt/qgenie/bin/qgenie"),
+    ]
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def default_codex_args() -> str:
+    return os.environ.get("AGENTIC_CODEX_ARGS", os.environ.get("CODEX_ARGS", ""))
+
+
 def default_claude_bin() -> str:
     env_bin = os.environ.get("CLAUDE_BIN")
     if env_bin:
@@ -1244,30 +1705,45 @@ def agent_bin_for(args: argparse.Namespace, provider: str) -> str:
     return getattr(args, "codex_bin", default_codex_bin())
 
 
+def codex_args_for(args: argparse.Namespace) -> list[str]:
+    value = str(getattr(args, "codex_args", default_codex_args()) or "")
+    try:
+        return shlex.split(value)
+    except ValueError as exc:
+        raise SystemExit(f"invalid Codex args: {exc}") from exc
+
+
 def is_qgenie_bin(agent_bin: str) -> bool:
     return Path(agent_bin).name == "qgenie"
 
 
-def resume_commands(provider: str, agent_bin: str, session_id: str) -> list[list[str]]:
+def resume_commands(
+    provider: str, agent_bin: str, session_id: str, codex_args: Sequence[str] = ()
+) -> list[list[str]]:
     if is_qgenie_bin(agent_bin):
         if provider == "claude":
             return [[agent_bin, "claude", "--resume", session_id]]
-        return [[agent_bin, "codex", "resume", session_id], [agent_bin, "resume", session_id]]
+        return [
+            [agent_bin, "codex", *codex_args, "resume", session_id],
+            [agent_bin, "resume", session_id],
+        ]
     if provider == "claude":
         return [[agent_bin, "--resume", session_id]]
-    return [[agent_bin, "resume", session_id]]
+    return [[agent_bin, *codex_args, "resume", session_id]]
 
 
-def resume_command(provider: str, agent_bin: str, session_id: str) -> list[str]:
-    return resume_commands(provider, agent_bin, session_id)[0]
+def resume_command(
+    provider: str, agent_bin: str, session_id: str, codex_args: Sequence[str] = ()
+) -> list[str]:
+    return resume_commands(provider, agent_bin, session_id, codex_args)[0]
 
 
 def shell_command(commands: Sequence[Sequence[str]]) -> str:
     return " || ".join(" ".join(shell_quote(part) for part in command) for command in commands)
 
 
-def resume_shell_command(session: Session, agent_bin: str) -> str:
-    command = shell_command(resume_commands(session.provider, agent_bin, session.id))
+def resume_shell_command(session: Session, agent_bin: str, codex_args: Sequence[str] = ()) -> str:
+    command = shell_command(resume_commands(session.provider, agent_bin, session.id, codex_args))
     if " || " in command:
         command = "(" + command + ")"
     if session.cwd:
@@ -1305,7 +1781,42 @@ def tmux_status_title(providers: Sequence[str]) -> str:
     return f"#[fg=colour235,bg=colour180,bold] {title} Sessions #[default]"
 
 
-def tmux_status_hint(providers: Sequence[str]) -> str:
+def qgenie_status_segment(qgenie_bin: str, script_path: str) -> str:
+    if not qgenie_bin or not script_path:
+        return ""
+    command = " ".join(
+        [
+            shell_quote(sys.executable or "python3"),
+            shell_quote(script_path),
+            "qgenie-status",
+            "--qgenie-bin",
+            shell_quote(qgenie_bin),
+            "--cache-ttl",
+            "60",
+        ]
+    )
+    # tmux runs status output through strftime after evaluating #() commands,
+    # so a literal percent from qgenie would be consumed as a format escape.
+    # Have sed emit two percent signs using octal escapes; tmux reduces ``%%``
+    # to one visible percent while preserving the unit in the status bar.
+    return f"#({command} 2>/dev/null | sed -e 's/^Qgenie //' -e 's/\\045/\\045\\045/g')"
+
+
+def tmux_status_hint(
+    providers: Sequence[str], qgenie_bin: str = "", script_path: str = ""
+) -> str:
+    qgenie = qgenie_status_segment(qgenie_bin, script_path) if "codex" in providers else ""
+    if qgenie:
+        # Keep the useful limits first, followed by the complete right-side
+        # tmux shortcuts that were shown before the usage segment was added.
+        prefix = tmux_prefix_key("prefix")
+        return (
+            f"#[fg=colour180]{qgenie} #[default]"
+            f"#[fg=colour180]{prefix}+? keys "
+            f"#[fg=colour244]{prefix}+b sidebar "
+            f"#[fg=colour244]{prefix}+←/→ panes "
+            f"#[fg=colour244]mouse focus"
+        )
     prefix = tmux_prefix_key("prefix")
     return (
         f"#[fg=colour180]{prefix}+? keys "
@@ -1325,7 +1836,7 @@ def tmux_help_lines(providers: Sequence[str], prefix: str | None = None) -> list
         "  Enter          resume selected session in the right pane",
         "  r              stage native /rename for the active resumed session",
         "  d              trash selected session after DELETE",
-        "  /, c, R        search, clear search, refresh",
+        "  / or \\, c, R   search, clear search, refresh",
         "  ?              expand/collapse sidebar help",
         "  q              close sidebar pane",
         "",
@@ -1347,7 +1858,7 @@ def tmux_help_popup_command(providers: Sequence[str]) -> tuple[str, str]:
 
 def tmux_help_fallback_message(providers: Sequence[str]) -> str:
     prefix = tmux_prefix_key("prefix")
-    return f"{providers_title(providers)}: Enter resume | / search | ? sidebar help | {prefix}+b sidebar | {prefix}+←/→ panes"
+    return f"{providers_title(providers)}: Enter resume | / or \\ search | ? sidebar help | {prefix}+b sidebar | {prefix}+←/→ panes"
 
 
 def tmux_help_popup_script(providers: Sequence[str]) -> str:
@@ -1423,14 +1934,56 @@ def ensure_tmux_status_length(option_name: str, minimum: int, dry_run: bool = Fa
         run_tmux(["set-option", "-q", option_name, str(minimum)], dry_run)
 
 
-def install_tmux_status_hint(providers: Sequence[str], dry_run: bool = False) -> None:
+def install_tmux_status_hint(
+    providers: Sequence[str],
+    dry_run: bool = False,
+    *,
+    qgenie_bin: str = "",
+    script_path: str = "",
+) -> None:
     title_marker = "@agentic_sessions_status_title"
-    hint_marker = "@agentic_sessions_status_hint"
+    hint_option = "@agentic_sessions_status_hint"
+    # Keep the live #() command at the top level of status-right.  If it is
+    # nested inside a user option, tmux either renders the command literally
+    # or never refreshes its output.  This zero-width conditional is only a
+    # raw marker for idempotence; it renders as an empty string.
+    hint_marker = "#{?@agentic_sessions_status_hint_installed,,}"
+    hint_segment = hint_marker + tmux_status_hint(providers, qgenie_bin, script_path)
+
+    if not dry_run:
+        # Migrate status-right values written by older versions, which used a
+        # nested user option and could display the qgenie command text.
+        try:
+            current_result = subprocess.run(
+                ["tmux", "show-option", "-qv", "status-right"],
+                text=True,
+                check=False,
+                capture_output=True,
+            )
+            current = current_result.stdout.rstrip("\n") if current_result.returncode == 0 else ""
+            legacy_refs = ("#[default]#{@agentic_sessions_status_hint}", "#[default]#{E:@agentic_sessions_status_hint}")
+            if any(legacy in current for legacy in legacy_refs):
+                original_result = subprocess.run(
+                    ["tmux", "show-option", "-qv", "@agentic_sessions_status_original_right"],
+                    text=True,
+                    check=False,
+                    capture_output=True,
+                )
+                if original_result.returncode == 0:
+                    current = original_result.stdout.rstrip("\n")
+                else:
+                    for legacy in legacy_refs:
+                        current = current.replace(legacy, "")
+                    current = current.strip()
+                run_tmux(["set-option", "-q", "status-right", current])
+        except Exception:
+            pass
+
     ensure_tmux_status_segment(
         "status-left",
         title_marker,
         "@agentic_sessions_status_original_left",
-        "#{@agentic_sessions_status_title}",
+        "#{E:@agentic_sessions_status_title}",
         False,
         dry_run,
     )
@@ -1438,14 +1991,29 @@ def install_tmux_status_hint(providers: Sequence[str], dry_run: bool = False) ->
         "status-right",
         hint_marker,
         "@agentic_sessions_status_original_right",
-        "#[default]#{@agentic_sessions_status_hint}",
+        "#[default]" + hint_segment,
         True,
         dry_run,
     )
     ensure_tmux_status_length("status-left-length", 32, dry_run)
-    ensure_tmux_status_length("status-right-length", 120, dry_run)
-    run_tmux(["set-option", "-q", title_marker, tmux_status_title(providers)], dry_run)
-    run_tmux(["set-option", "-q", hint_marker, tmux_status_hint(providers)], dry_run)
+    ensure_tmux_status_length("status-right-length", 200, dry_run)
+    run_tmux(
+        [
+            "set-option",
+            "-q",
+            title_marker,
+            tmux_status_title(providers),
+        ],
+        dry_run,
+    )
+    run_tmux(
+        ["set-option", "-q", hint_option, tmux_status_hint(providers, qgenie_bin, script_path)],
+        dry_run,
+    )
+    run_tmux(
+        ["set-option", "-q", "@agentic_sessions_status_hint_installed", "1"],
+        dry_run,
+    )
     run_tmux(["set-option", "-q", "status", "on"], dry_run)
 
 
@@ -1471,6 +2039,7 @@ def install_sidebar_reopen_key(
     python_bin: str,
     provider_text: str,
     codex_bin: str,
+    codex_args: str,
     claude_bin: str,
     width: str,
     dry_run: bool = False,
@@ -1485,6 +2054,7 @@ def install_sidebar_reopen_key(
         + shell_quote(provider_text)
         + " sidebar --target-pane '$target' --codex-bin "
         + shell_quote(codex_bin)
+        + (" --codex-args " + shell_quote(codex_args) if codex_args else "")
         + " --claude-bin "
         + shell_quote(claude_bin)
         + "\"; "
@@ -1543,7 +2113,7 @@ Sidebar keys:
   Enter         : resume here
   r             : prefill native /rename in agent pane
   d             : trash; confirm DELETE
-  /             : search
+  / or \\       : search
   c             : clear search
   q             : close sidebar
 
@@ -1570,7 +2140,7 @@ def print_right_pane_help(providers: Sequence[str]) -> None:
         "  Enter         : resume here\n"
         "  r             : prefill native /rename in agent pane\n"
         "  d             : trash; confirm DELETE\n"
-        "  /             : search\n"
+        "  / or \\        : search\n"
         "  c             : clear search\n"
         "  q             : close sidebar\n\n"
         "Tmux pane keys:\n"
@@ -1590,6 +2160,7 @@ def sidebar_shell_command(
     script: str,
     right_pane: str,
     codex_bin: str,
+    codex_args: str,
     claude_bin: str,
     python_bin: str,
     provider_text: str,
@@ -1621,6 +2192,7 @@ def sidebar_shell_command(
         + shell_quote(right_pane)
         + " --codex-bin "
         + shell_quote(codex_bin)
+        + (" --codex-args " + shell_quote(codex_args) if codex_args else "")
         + " --claude-bin "
         + shell_quote(claude_bin)
         + " 2>>\"$log\""
@@ -1630,10 +2202,15 @@ def sidebar_shell_command(
 def command_tmux(args: argparse.Namespace) -> int:
     ensure_tmux()
     providers = selected_providers(args)
+    if "codex" in providers:
+        codex_args_for(args)
     provider_text = ",".join(providers)
     frozen_config = build_config(args, providers[0]) if len(providers) == 1 else None
     script = str(Path(__file__).resolve())
     python_bin = sys.executable or "python3"
+    qgenie_bin = ""
+    if "codex" in providers:
+        qgenie_bin = args.codex_bin if is_qgenie_bin(args.codex_bin) else default_qgenie_bin()
     session_name = args.name
     width = str(args.width)
     placeholder = right_pane_help_command(providers)
@@ -1641,32 +2218,60 @@ def command_tmux(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("# tmux commands that would be used")
 
-    if os.environ.get("TMUX") and not args.new_session:
+    had_tmux_environment = bool(os.environ.get("TMUX"))
+    right_pane = current_tmux_pane() if had_tmux_environment else ""
+    if had_tmux_environment and not right_pane and not tmux_server_available():
+        # A shell can retain TMUX after its socket/server was removed.  Do not
+        # let detached-session creation keep targeting that dead socket.
+        os.environ.pop("TMUX", None)
+        os.environ.pop("TMUX_PANE", None)
+
+    if right_pane and not args.new_session:
         if not args.dry_run:
             print_right_pane_help(providers)
-        right_pane = subprocess.run(
-            ["tmux", "display-message", "-p", "#{pane_id}"],
-            text=True,
-            check=True,
-            capture_output=True,
-        ).stdout.strip()
         sidebar_cmd = sidebar_shell_command(
-            script, right_pane, args.codex_bin, args.claude_bin, python_bin, provider_text, frozen_config
+            script,
+            right_pane,
+            args.codex_bin,
+            args.codex_args,
+            args.claude_bin,
+            python_bin,
+            provider_text,
+            frozen_config,
         )
         if args.dry_run:
             print(f"# inside tmux: split current window; target right pane is {right_pane}")
             split_sidebar_pane(right_pane, width, sidebar_cmd, True)
             remember_sidebar_reopen(right_pane, "", sidebar_cmd, width, True)
-            install_sidebar_reopen_key(script, python_bin, provider_text, args.codex_bin, args.claude_bin, width, True)
+            install_sidebar_reopen_key(
+                script,
+                python_bin,
+                provider_text,
+                args.codex_bin,
+                args.codex_args,
+                args.claude_bin,
+                width,
+                True,
+            )
             install_tmux_help_key(providers, True)
-            install_tmux_status_hint(providers, True)
+            install_tmux_status_hint(
+                providers, True, qgenie_bin=qgenie_bin, script_path=script
+            )
             run_tmux(["select-pane", "-t", right_pane], True)
             return 0
         sidebar_pane = split_sidebar_pane(right_pane, width, sidebar_cmd)
         remember_sidebar_reopen(right_pane, sidebar_pane, sidebar_cmd, width)
-        install_sidebar_reopen_key(script, python_bin, provider_text, args.codex_bin, args.claude_bin, width)
+        install_sidebar_reopen_key(
+            script,
+            python_bin,
+            provider_text,
+            args.codex_bin,
+            args.codex_args,
+            args.claude_bin,
+            width,
+        )
         install_tmux_help_key(providers)
-        install_tmux_status_hint(providers)
+        install_tmux_status_hint(providers, qgenie_bin=qgenie_bin, script_path=script)
         run_tmux(["select-pane", "-t", right_pane])
         return 0
 
@@ -1681,13 +2286,28 @@ def command_tmux(args: argparse.Namespace) -> int:
         capture_output=True,
     ).stdout.strip()
     sidebar_cmd = sidebar_shell_command(
-        script, right_pane, args.codex_bin, args.claude_bin, python_bin, provider_text, frozen_config
+        script,
+        right_pane,
+        args.codex_bin,
+        args.codex_args,
+        args.claude_bin,
+        python_bin,
+        provider_text,
+        frozen_config,
     )
     sidebar_pane = split_sidebar_pane(right_pane, width, sidebar_cmd)
     remember_sidebar_reopen(right_pane, sidebar_pane, sidebar_cmd, width)
-    install_sidebar_reopen_key(script, python_bin, provider_text, args.codex_bin, args.claude_bin, width)
+    install_sidebar_reopen_key(
+        script,
+        python_bin,
+        provider_text,
+        args.codex_bin,
+        args.codex_args,
+        args.claude_bin,
+        width,
+    )
     install_tmux_help_key(providers)
-    install_tmux_status_hint(providers)
+    install_tmux_status_hint(providers, qgenie_bin=qgenie_bin, script_path=script)
     run_tmux(["select-pane", "-t", right_pane])
     if args.no_attach:
         print(f"created tmux session: {session_name}")
@@ -1846,23 +2466,64 @@ def sidebar_attrs() -> dict:
 
 
 def prompt(stdscr: curses.window, row: int, label: str, initial: str = "") -> str | None:
-    curses.echo()
-    curses.curs_set(1)
-    height, width = stdscr.getmaxyx()
+    curses.noecho()
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    _, width = stdscr.getmaxyx()
     stdscr.move(row, 0)
     stdscr.clrtoeol()
     text = f"{label}: "
     stdscr.addnstr(row, 0, text, width - 1)
-    if initial:
-        stdscr.addnstr(initial, max(0, width - len(text) - 1))
-    stdscr.refresh()
+    field_width = max(1, width - len(text) - 1)
+    chars = list(initial)
+    cursor = len(chars)
+    offset = 0
     try:
-        value = stdscr.getstr(row, len(text), max(1, width - len(text) - 1)).decode()
+        while True:
+            if cursor < offset:
+                offset = cursor
+            elif cursor >= offset + field_width:
+                offset = cursor - field_width + 1
+            value = "".join(chars)
+            visible = value[offset : offset + field_width]
+            stdscr.addnstr(row, len(text), visible.ljust(field_width), field_width)
+            stdscr.move(row, len(text) + cursor - offset)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (10, 13):
+                return value
+            if key == 27:
+                return None
+            if key in (curses.KEY_BACKSPACE, 8, 127):
+                if cursor:
+                    del chars[cursor - 1]
+                    cursor -= 1
+            elif key == curses.KEY_DC:
+                if cursor < len(chars):
+                    del chars[cursor]
+            elif key == curses.KEY_LEFT:
+                cursor = max(0, cursor - 1)
+            elif key == curses.KEY_RIGHT:
+                cursor = min(len(chars), cursor + 1)
+            elif key == curses.KEY_HOME:
+                cursor = 0
+            elif key == curses.KEY_END:
+                cursor = len(chars)
+            elif 0 <= key <= 255:
+                char = chr(key)
+                if char.isprintable():
+                    chars.insert(cursor, char)
+                    cursor += 1
     except KeyboardInterrupt:
-        value = None
-    curses.noecho()
-    curses.curs_set(0)
-    return value
+        return None
+    finally:
+        curses.noecho()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
 
 
 def prepare_pane_for_resume(target_pane: str, suspend_running: bool) -> None:
@@ -1872,13 +2533,30 @@ def prepare_pane_for_resume(target_pane: str, suspend_running: bool) -> None:
     time.sleep(0.35)
 
 
-def send_resume_to_pane(target_pane: str, session: Session, agent_bin: str, kill_running: bool) -> None:
+def send_resume_to_pane(
+    target_pane: str,
+    session: Session,
+    agent_bin: str,
+    kill_running: bool,
+    codex_args: Sequence[str] = (),
+    config: Config | None = None,
+    recover_existing: bool = True,
+) -> str:
+    if config is not None:
+        handled, recovery_message = recover_existing_session(
+            session,
+            config,
+            allow_terminate=kill_running and recover_existing,
+        )
+        if handled:
+            return recovery_message
     prepare_pane_for_resume(target_pane, kill_running)
     subprocess.run(
-        ["tmux", "send-keys", "-t", target_pane, resume_shell_command(session, agent_bin), "Enter"],
+        ["tmux", "send-keys", "-t", target_pane, resume_shell_command(session, agent_bin, codex_args), "Enter"],
         check=False,
     )
     subprocess.run(["tmux", "select-pane", "-t", target_pane], check=False)
+    return f"sent resume for {session.id[:12]}"
 
 
 def active_session_key(session: Session) -> str:
@@ -1962,13 +2640,14 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
     configs = build_configs(args)
     providers = [config.provider for config in configs]
     agent_bins = {provider: agent_bin_for(args, provider) for provider in providers}
+    codex_args = codex_args_for(args) if "codex" in providers else []
     curses.curs_set(0)
     attrs = sidebar_attrs()
     stdscr.timeout(120)
     selected = 0
     query = ""
     tmux_prefix = tmux_prefix_key()
-    help_text = "↑↓/j/k move · Enter resume · / search · ? details · q close"
+    help_text = "↑↓/j/k move · Enter resume · / or \\ search · ? details · q close"
     help_lines = [help_text]
     message = help_text
     active_key = ""
@@ -2019,7 +2698,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
         if show_help:
             help_lines = [
                 "Keys  ↑↓/j/k move · PgUp/PgDn jump · Enter resume selected",
-                "Edit  r stage /rename active · d trash · / search · c clear · R refresh",
+                "Edit  r stage /rename active · d trash · / or \\ search · c clear · R refresh",
                 f"Tmux  {tmux_prefix}+b sidebar · {tmux_prefix}+←/→ panes · mouse click focus",
                 "Help  ? hide keys · q close sidebar",
             ]
@@ -2084,7 +2763,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
             selected = min(selected + page_size, max(0, len(sessions) - 1))
         elif key == curses.KEY_PPAGE:
             selected = max(0, selected - page_size)
-        elif key in (ord("/"),):
+        elif key in (ord("/"), ord("\\")):
             value = prompt(stdscr, height - 1, "search", query)
             if value is not None:
                 query = value.strip()
@@ -2102,9 +2781,17 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
         elif key in (10, 13):
             if sessions:
                 current = sessions[selected]
-                send_resume_to_pane(args.target_pane, current, agent_bins[current.provider], args.kill_running)
+                recovery_config = config_for_provider(configs, current.provider)
+                message = send_resume_to_pane(
+                    args.target_pane,
+                    current,
+                    agent_bins[current.provider],
+                    args.kill_running,
+                    codex_args,
+                    recovery_config,
+                    not args.no_recover_existing,
+                )
                 active_key = active_session_key(current)
-                message = f"sent resume for {sessions[selected].id[:12]}"
         elif key == ord("r"):
             if sessions:
                 current = sessions[selected]
@@ -2214,8 +2901,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_global_args(p)
     p.add_argument("selector", help="session id/prefix/title fragment")
     p.add_argument("--codex-bin", default=default_codex_bin(), help="codex executable")
+    p.add_argument(
+        "--codex-args",
+        default=default_codex_args(),
+        help="extra Codex CLI args before resume; default from AGENTIC_CODEX_ARGS or CODEX_ARGS",
+    )
     p.add_argument("--claude-bin", default=default_claude_bin(), help="claude executable")
     p.add_argument("--print-command", action="store_true", help="print instead of exec")
+    p.add_argument(
+        "--no-recover-existing",
+        action="store_true",
+        help="do not foreground or stop an existing process for this session",
+    )
     p.add_argument("--match-limit", type=int, default=200, help="maximum matching rows to scan")
     p.add_argument("--all", action="store_true", help="include generated/background child sessions")
     p.set_defaults(func=command_resume)
@@ -2228,6 +2925,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--new-session", action="store_true", help="force a new tmux session even inside tmux")
     p.add_argument("--dry-run", action="store_true", help="print tmux commands only")
     p.add_argument("--codex-bin", default=default_codex_bin(), help="codex executable")
+    p.add_argument(
+        "--codex-args",
+        default=default_codex_args(),
+        help="extra Codex CLI args before resume; default from AGENTIC_CODEX_ARGS or CODEX_ARGS",
+    )
     p.add_argument("--claude-bin", default=default_claude_bin(), help="claude executable")
     p.set_defaults(func=command_tmux)
 
@@ -2235,6 +2937,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_global_args(p)
     p.add_argument("--target-pane", help="tmux pane id to receive codex resume commands")
     p.add_argument("--codex-bin", default=default_codex_bin(), help="codex executable")
+    p.add_argument(
+        "--codex-args",
+        default=default_codex_args(),
+        help="extra Codex CLI args before resume; default from AGENTIC_CODEX_ARGS or CODEX_ARGS",
+    )
     p.add_argument("--claude-bin", default=default_claude_bin(), help="claude executable")
     suspend_group = p.add_mutually_exclusive_group()
     suspend_group.add_argument(
@@ -2252,10 +2959,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="send resume without first suspending the right-pane process",
     )
+    p.add_argument(
+        "--no-recover-existing",
+        action="store_true",
+        help="do not foreground or stop an existing process for the selected session",
+    )
     p.add_argument("--render-once", action="store_true")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--all", action="store_true", help="include generated/background child sessions")
     p.set_defaults(func=command_sidebar)
+
+    p = sub.add_parser("qgenie-status", help=argparse.SUPPRESS)
+    p.add_argument("--qgenie-bin", required=True)
+    p.add_argument("--cache-ttl", type=float, default=60.0)
+    p.add_argument("--cache-path")
+    p.set_defaults(func=command_qgenie_status)
 
     return parser
 
