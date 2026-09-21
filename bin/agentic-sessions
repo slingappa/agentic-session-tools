@@ -64,6 +64,8 @@ class Session:
     last_prompt: str
     custom_title: str = ""
     native_title: str = ""
+    resume_id: str = ""
+    search_snippet: str = ""
 
     @property
     def title(self) -> str:
@@ -76,6 +78,10 @@ class Session:
         if self.cwd:
             return Path(self.cwd).name or self.cwd
         return self.id
+
+    @property
+    def resumable_id(self) -> str:
+        return self.resume_id or self.id
 
 
 @dataclass
@@ -143,6 +149,14 @@ def providers_title(providers: Sequence[str]) -> str:
     return provider_title(providers[0]) if len(providers) == 1 else "Agentic"
 
 
+def unique_providers(providers: Iterable[str]) -> list[str]:
+    unique: list[str] = []
+    for provider in providers:
+        if provider not in unique:
+            unique.append(provider)
+    return unique
+
+
 def provider_label(provider: str) -> str:
     return "Cl" if provider == "claude" else "Cx"
 
@@ -200,6 +214,20 @@ def load_title_metadata(config: Config) -> dict:
     return names
 
 
+def merge_title_metadata(items: Iterable[dict]) -> dict:
+    merged: dict = {}
+    native_titles: dict = {}
+    for names in items:
+        for key, value in names.items():
+            if key == NATIVE_TITLES_KEY and isinstance(value, dict):
+                native_titles.update(value)
+            else:
+                merged[key] = value
+    if native_titles:
+        merged[NATIVE_TITLES_KEY] = native_titles
+    return merged
+
+
 def parse_env_value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -235,6 +263,26 @@ def load_local_env() -> None:
 
 
 def default_agent_home(provider: str = "codex") -> Path:
+    homes = default_agent_homes(provider)
+    return homes[0]
+
+
+def unique_paths(paths: Iterable[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def default_agent_homes(provider: str = "codex") -> list[Path]:
     provider = normalize_provider(provider)
     if provider == "claude":
         candidates: list[Path] = []
@@ -246,8 +294,8 @@ def default_agent_home(provider: str = "codex") -> Path:
         candidates.append(expand("~/.config/claude"))
         for candidate in candidates:
             if (candidate / "projects").exists():
-                return candidate
-        return candidates[0]
+                return [candidate]
+        return [candidates[0]]
 
     candidates: list[Path] = []
     if os.environ.get("CODEX_HOME"):
@@ -257,12 +305,11 @@ def default_agent_home(provider: str = "codex") -> Path:
         qgenie_home = expand(os.environ["QGENIE_CLI_HOME"])
         candidates.extend([qgenie_home / "agent", qgenie_home])
     candidates.append(expand("~/.config/qgenie-cli/agent"))
+    candidates.append(expand("~/workspace/.codex"))
     candidates.append(expand("~/.codex"))
     candidates.append(expand("~/.config/codex"))
-    for candidate in candidates:
-        if (candidate / "sessions").exists():
-            return candidate
-    return candidates[0]
+    existing = [candidate for candidate in unique_paths(candidates) if (candidate / "sessions").exists()]
+    return existing or [candidates[0]]
 
 
 def build_config(args: argparse.Namespace, provider: str | None = None) -> Config:
@@ -299,7 +346,22 @@ def build_config(args: argparse.Namespace, provider: str | None = None) -> Confi
 
 
 def build_configs(args: argparse.Namespace) -> list[Config]:
-    return [build_config(args, provider) for provider in selected_providers(args)]
+    configs: list[Config] = []
+    explicit_agent_home = hasattr(args, "agent_home")
+    explicit_sessions_root = hasattr(args, "sessions_root")
+    explicit_state_root = hasattr(args, "state_root")
+    explicit_codex_root = bool(os.environ.get("CODEX_SESSIONS_ROOT"))
+    for provider in selected_providers(args):
+        if provider != "codex" or explicit_agent_home or explicit_sessions_root or explicit_codex_root:
+            configs.append(build_config(args, provider))
+            continue
+        for agent_home in default_agent_homes("codex"):
+            config_args = argparse.Namespace(**vars(args))
+            config_args.agent_home = str(agent_home)
+            if explicit_state_root:
+                config_args.state_root = getattr(args, "state_root")
+            configs.append(build_config(config_args, provider))
+    return configs
 
 
 def config_for_provider(configs: Sequence[Config], provider: str) -> Config:
@@ -307,6 +369,19 @@ def config_for_provider(configs: Sequence[Config], provider: str) -> Config:
         if config.provider == provider:
             return config
     raise SystemExit(f"no config for provider: {provider}")
+
+
+def config_for_session(configs: Sequence[Config], session: Session) -> Config:
+    matches = [config for config in configs if config.provider == session.provider]
+    for config in matches:
+        try:
+            session.path.resolve().relative_to(config.sessions_root.resolve())
+            return config
+        except (OSError, ValueError):
+            continue
+    if matches:
+        return matches[0]
+    raise SystemExit(f"no config for provider: {session.provider}")
 
 
 def load_json_object(path: Path) -> dict:
@@ -388,6 +463,72 @@ def extract_text_from_message(payload: dict) -> str:
     return "\n".join(texts).strip()
 
 
+def iter_string_values(value: object) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from iter_string_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from iter_string_values(nested)
+
+
+def record_content_texts(record: dict, provider: str) -> Iterable[str]:
+    if provider == "codex":
+        if record.get("type") != "response_item":
+            return
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            if "content" in payload:
+                yield from iter_string_values(payload.get("content"))
+            text = payload.get("text")
+            if isinstance(text, str):
+                yield text
+        return
+
+    message = record.get("message")
+    if isinstance(message, dict):
+        if "content" in message:
+            yield from iter_string_values(message.get("content"))
+        text = message.get("text")
+        if isinstance(text, str):
+            yield text
+    last_prompt = record.get("lastPrompt")
+    if isinstance(last_prompt, str):
+        yield last_prompt
+
+
+def session_content_match(config: Config, path: Path, needle: str) -> str:
+    if not needle:
+        return ""
+    lowered = needle.lower()
+    try:
+        with path.open(errors="replace") as handle:
+            for raw in handle:
+                try:
+                    record = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                for text in record_content_texts(record, config.provider):
+                    if text and not is_injected_user_context(text) and lowered in text.lower():
+                        return normalize_ws(text)
+    except OSError:
+        pass
+    return ""
+
+
+def session_content_contains(config: Config, path: Path, needle: str) -> bool:
+    return bool(session_content_match(config, path, needle))
+
+
+def with_search_snippet(session: Session, snippet: str) -> Session:
+    session.search_snippet = snippet
+    return session
+
+
 def parse_codex_session(
     path: Path, names: dict, scan_all_prompts: bool = False, fast_sidebar: bool = False
 ) -> Session | None:
@@ -455,6 +596,7 @@ def parse_codex_session(
         last_prompt=last_prompt,
         custom_title=str(custom_title),
         native_title=str(native_title),
+        resume_id=fallback_id or session_id,
     )
 
 
@@ -550,6 +692,7 @@ def parse_claude_session(
         last_prompt=last_prompt,
         custom_title=str(custom_title),
         native_title=str(native_title),
+        resume_id=session_id,
     )
 
 
@@ -663,13 +806,19 @@ def load_sessions(
         if not session or session.id in seen_ids:
             continue
         seen_ids.add(session.id)
-        if query and query.lower() not in session_haystack(session):
-            continue
+        needle = query.lower()
+        if needle and needle not in session_haystack(session):
+            snippet = session_content_match(config, path, needle)
+            if not snippet:
+                continue
+            session = with_search_snippet(session, snippet)
         sessions.append(session)
-        if limit and len(sessions) >= limit:
+        if limit and not query and len(sessions) >= limit:
             break
     if query:
-        sessions.sort(key=lambda session: session.modified, reverse=True)
+        sort_sessions(sessions, query)
+        if limit:
+            return sessions[:limit]
     return sessions
 
 
@@ -692,11 +841,22 @@ def load_sessions_from_configs(
                 fast_sidebar=fast_sidebar,
                 include_generated=include_generated,
             )
-        )
-    sessions.sort(key=lambda session: session.modified, reverse=True)
+    )
+    sessions = dedupe_sessions(sessions)
+    sort_sessions(sessions, query)
     if limit:
         return sessions[:limit]
     return sessions
+
+
+def dedupe_sessions(sessions: Iterable[Session]) -> list[Session]:
+    by_key: dict[str, Session] = {}
+    for session in sessions:
+        key = session_name_key(session.provider, session.id)
+        current = by_key.get(key)
+        if current is None or session.modified > current.modified:
+            by_key[key] = session
+    return list(by_key.values())
 
 
 def session_files(config: Config) -> list[Path]:
@@ -714,16 +874,31 @@ def is_session_file(config: Config, name: str) -> bool:
 def session_file_infos(config: Config) -> list[tuple[float, Path]]:
     infos: list[tuple[float, Path]] = []
     stack = [config.sessions_root]
+    seen_dirs: set[tuple[int, int]] = set()
+    seen_files: set[tuple[int, int]] = set()
     while stack:
         directory = stack.pop()
+        try:
+            directory_stat = directory.stat()
+        except OSError:
+            continue
+        directory_key = (directory_stat.st_dev, directory_stat.st_ino)
+        if directory_key in seen_dirs:
+            continue
+        seen_dirs.add(directory_key)
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
                     try:
-                        if entry.is_dir(follow_symlinks=False):
+                        if entry.is_dir(follow_symlinks=True):
                             stack.append(Path(entry.path))
-                        elif entry.is_file(follow_symlinks=False) and is_session_file(config, entry.name):
-                            infos.append((entry.stat(follow_symlinks=False).st_mtime, Path(entry.path)))
+                        elif entry.is_file(follow_symlinks=True) and is_session_file(config, entry.name):
+                            file_stat = entry.stat(follow_symlinks=True)
+                            file_key = (file_stat.st_dev, file_stat.st_ino)
+                            if file_key in seen_files:
+                                continue
+                            seen_files.add(file_key)
+                            infos.append((file_stat.st_mtime, Path(entry.path)))
                     except OSError:
                         continue
         except OSError:
@@ -765,6 +940,7 @@ def light_session_from_path(config: Config, path: Path, names: dict) -> Session 
         last_prompt="",
         custom_title=custom_title_for(names, config.provider, session_id),
         native_title=str(meta.get("native_title") or native_title_for(names, session_id)),
+        resume_id=session_id_from_path(path) if config.provider == "codex" else session_id,
     )
 
 
@@ -783,10 +959,17 @@ def load_session_index(config: Config, query: str = "", limit: int = 0, include_
             if parsed:
                 session = parsed
         if needle and needle not in session_haystack(session):
-            continue
+            snippet = session_content_match(config, path, needle)
+            if not snippet:
+                continue
+            session = with_search_snippet(session, snippet)
         sessions.append(session)
-        if limit and len(sessions) >= limit:
+        if limit and not query and len(sessions) >= limit:
             break
+    if query:
+        sort_sessions(sessions, query)
+        if limit:
+            return sessions[:limit]
     return sessions
 
 
@@ -796,7 +979,8 @@ def load_session_index_from_configs(
     sessions: list[Session] = []
     for config in configs:
         sessions.extend(load_session_index(config, query, limit=limit, include_generated=include_generated))
-    sessions.sort(key=lambda session: session.modified, reverse=True)
+    sessions = dedupe_sessions(sessions)
+    sort_sessions(sessions, query)
     if limit:
         return sessions[:limit]
     return sessions
@@ -806,7 +990,12 @@ class SidebarIndexLoader:
     def __init__(self, configs: Sequence[Config], query: str = "", include_generated: bool = False):
         self.query = query.lower()
         self.include_generated = include_generated
-        self.names_by_provider = {config.provider: load_title_metadata(config) for config in configs}
+        self.names_by_provider = {
+            provider: merge_title_metadata(
+                load_title_metadata(config) for config in configs if config.provider == provider
+            )
+            for provider in unique_providers(config.provider for config in configs)
+        }
         self.pending: list[tuple[float, Config, Path]] = []
         self.index = 0
         self.done = False
@@ -823,7 +1012,7 @@ class SidebarIndexLoader:
         added: list[Session] = []
         checked = 0
         while self.index < len(self.pending) and checked < path_budget:
-            if limit and existing_count + len(added) >= limit:
+            if limit and not self.query and existing_count + len(added) >= limit:
                 self.done = True
                 break
             _, config, path = self.pending[self.index]
@@ -851,9 +1040,16 @@ class SidebarIndexLoader:
                     if key in self.seen:
                         continue
             if self.query and self.query not in session_haystack(session):
-                continue
+                snippet = session_content_match(config, path, self.query)
+                if not snippet:
+                    continue
+                session = with_search_snippet(session, snippet)
             self.seen.add(key)
             added.append(session)
+        if self.query:
+            sort_sessions(added, self.query)
+            if limit:
+                added = added[: max(0, limit - existing_count)]
         if self.index >= len(self.pending):
             self.done = True
         return added
@@ -908,14 +1104,49 @@ def resolve_session_selector_any(
                     sessions.append(session)
         else:
             sessions.extend(load_sessions(config, selector, limit=match_limit, include_generated=include_generated))
-    sessions.sort(key=lambda session: session.modified, reverse=True)
+    if looks_like_id_fragment(needle) and not sessions:
+        sessions.extend(load_sessions_from_configs(configs, selector, include_generated=include_generated))
+    sessions = dedupe_sessions(sessions)
+    sort_sessions(sessions, selector)
     return resolve_session(sessions[:match_limit] if match_limit else sessions, selector)
 
 
 def session_haystack(session: Session) -> str:
     return "\n".join(
-        [session.provider, session.id, session.title, session.first_prompt, session.last_prompt, session.cwd, str(session.path)]
+        [
+            session.provider,
+            session.id,
+            session.title,
+            session.first_prompt,
+            session.last_prompt,
+            session.search_snippet,
+            session.cwd,
+            str(session.path),
+        ]
     ).lower()
+
+
+def session_name_haystack(session: Session) -> str:
+    return "\n".join(
+        [session.provider, session.id, session.title, session.custom_title, session.native_title]
+    ).lower()
+
+
+def session_search_rank(session: Session, query: str = "") -> tuple[int, float]:
+    needle = query.lower()
+    if not needle:
+        return (0, -session.modified)
+    if needle in session_name_haystack(session):
+        return (0, -session.modified)
+    if needle in "\n".join(
+        [session.first_prompt, session.last_prompt, session.search_snippet, session.cwd, str(session.path)]
+    ).lower():
+        return (1, -session.modified)
+    return (2, -session.modified)
+
+
+def sort_sessions(sessions: list[Session], query: str = "") -> None:
+    sessions.sort(key=lambda session: session_search_rank(session, query))
 
 
 def format_time(epoch: float) -> str:
@@ -992,6 +1223,7 @@ def print_sessions(sessions: Sequence[Session], long: bool = False, json_output:
                 {
                     "provider": s.provider,
                     "id": s.id,
+                    "resume_id": s.resumable_id,
                     "title": s.title,
                     "custom_title": s.custom_title,
                     "native_title": s.native_title,
@@ -1001,6 +1233,7 @@ def print_sessions(sessions: Sequence[Session], long: bool = False, json_output:
                     "cwd": s.cwd,
                     "first_prompt": s.first_prompt,
                     "last_prompt": s.last_prompt,
+                    "search_snippet": s.search_snippet,
                     "path": str(s.path),
                     "source": s.source,
                     "model_provider": s.model_provider,
@@ -1072,12 +1305,16 @@ def include_generated_sessions(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "all", False))
 
 
+def include_generated_for_sidebar(args: argparse.Namespace, query: str = "") -> bool:
+    return include_generated_sessions(args) or bool(query.strip())
+
+
 def command_rename(args: argparse.Namespace) -> int:
     configs = build_configs(args)
     session = resolve_session_selector_any(
         configs, args.selector, args.match_limit, include_generated=include_generated_sessions(args)
     )
-    config = config_for_provider(configs, session.provider)
+    config = config_for_session(configs, session)
     names = load_json_object(config.names_file)
     key = session_name_key(session.provider, session.id)
     title = args.title.strip()
@@ -1134,7 +1371,7 @@ def command_delete(args: argparse.Namespace) -> int:
     session = resolve_session_selector_any(
         configs, args.selector, args.match_limit, include_generated=include_generated_sessions(args)
     )
-    config = config_for_provider(configs, session.provider)
+    config = config_for_session(configs, session)
     if not args.yes:
         answer = input(f"Move session {session.id} ({session.title}) to trash? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
@@ -1152,11 +1389,11 @@ def command_resume(args: argparse.Namespace) -> int:
     )
     agent_bin = agent_bin_for(args, session.provider)
     codex_args = codex_args_for(args) if session.provider == "codex" else []
-    commands = resume_commands(session.provider, agent_bin, session.id, codex_args)
+    config = config_for_session(configs, session)
+    commands = resume_commands(session.provider, agent_bin, session.resumable_id, codex_args)
     if args.print_command:
-        print(resume_shell_command(session, agent_bin, codex_args))
+        print(resume_shell_command(session, agent_bin, codex_args, config))
         return 0
-    config = config_for_provider(configs, session.provider)
     handled, recovery_message = recover_existing_session(
         session, config, allow_terminate=not getattr(args, "no_recover_existing", False)
     )
@@ -1166,6 +1403,10 @@ def command_resume(args: argparse.Namespace) -> int:
         return 0
     if session.cwd:
         os.chdir(session.cwd)
+    if session.provider == "codex":
+        os.environ["CODEX_HOME"] = str(config.agent_home)
+    elif session.provider == "claude":
+        os.environ["CLAUDE_CONFIG_DIR"] = str(config.agent_home)
     if len(commands) == 1:
         command = commands[0]
         os.execvp(command[0], command)
@@ -1742,8 +1983,22 @@ def shell_command(commands: Sequence[Sequence[str]]) -> str:
     return " || ".join(" ".join(shell_quote(part) for part in command) for command in commands)
 
 
-def resume_shell_command(session: Session, agent_bin: str, codex_args: Sequence[str] = ()) -> str:
-    command = shell_command(resume_commands(session.provider, agent_bin, session.id, codex_args))
+def command_env_prefix(config: Config | None, provider: str) -> str:
+    if config is None:
+        return ""
+    if provider == "codex":
+        return "export CODEX_HOME=" + shell_quote(str(config.agent_home)) + "; "
+    if provider == "claude":
+        return "export CLAUDE_CONFIG_DIR=" + shell_quote(str(config.agent_home)) + "; "
+    return ""
+
+
+def resume_shell_command(
+    session: Session, agent_bin: str, codex_args: Sequence[str] = (), config: Config | None = None
+) -> str:
+    command = command_env_prefix(config, session.provider) + shell_command(
+        resume_commands(session.provider, agent_bin, session.resumable_id, codex_args)
+    )
     if " || " in command:
         command = "(" + command + ")"
     if session.cwd:
@@ -2042,6 +2297,7 @@ def install_sidebar_reopen_key(
     codex_args: str,
     claude_bin: str,
     width: str,
+    include_all: bool = False,
     dry_run: bool = False,
 ) -> None:
     keys = ("b", "S")
@@ -2057,6 +2313,7 @@ def install_sidebar_reopen_key(
         + (" --codex-args " + shell_quote(codex_args) if codex_args else "")
         + " --claude-bin "
         + shell_quote(claude_bin)
+        + (" --all" if include_all else "")
         + "\"; "
     )
     script = (
@@ -2165,6 +2422,7 @@ def sidebar_shell_command(
     python_bin: str,
     provider_text: str,
     config: Config | None,
+    include_all: bool = False,
 ) -> str:
     command = (
         "log=/tmp/agentic-sessions-sidebar-${TMUX_PANE#%}.log; "
@@ -2195,6 +2453,7 @@ def sidebar_shell_command(
         + (" --codex-args " + shell_quote(codex_args) if codex_args else "")
         + " --claude-bin "
         + shell_quote(claude_bin)
+        + (" --all" if include_all else "")
         + " 2>>\"$log\""
     )
 
@@ -2205,7 +2464,15 @@ def command_tmux(args: argparse.Namespace) -> int:
     if "codex" in providers:
         codex_args_for(args)
     provider_text = ",".join(providers)
-    frozen_config = build_config(args, providers[0]) if len(providers) == 1 else None
+    freezes_discovery = (
+        len(providers) == 1
+        and (
+            hasattr(args, "agent_home")
+            or hasattr(args, "sessions_root")
+            or bool(os.environ.get("CODEX_SESSIONS_ROOT"))
+        )
+    )
+    frozen_config = build_config(args, providers[0]) if freezes_discovery else None
     script = str(Path(__file__).resolve())
     python_bin = sys.executable or "python3"
     qgenie_bin = ""
@@ -2238,6 +2505,7 @@ def command_tmux(args: argparse.Namespace) -> int:
             python_bin,
             provider_text,
             frozen_config,
+            args.all,
         )
         if args.dry_run:
             print(f"# inside tmux: split current window; target right pane is {right_pane}")
@@ -2251,6 +2519,7 @@ def command_tmux(args: argparse.Namespace) -> int:
                 args.codex_args,
                 args.claude_bin,
                 width,
+                args.all,
                 True,
             )
             install_tmux_help_key(providers, True)
@@ -2269,6 +2538,7 @@ def command_tmux(args: argparse.Namespace) -> int:
             args.codex_args,
             args.claude_bin,
             width,
+            args.all,
         )
         install_tmux_help_key(providers)
         install_tmux_status_hint(providers, qgenie_bin=qgenie_bin, script_path=script)
@@ -2294,6 +2564,7 @@ def command_tmux(args: argparse.Namespace) -> int:
         python_bin,
         provider_text,
         frozen_config,
+        args.all,
     )
     sidebar_pane = split_sidebar_pane(right_pane, width, sidebar_cmd)
     remember_sidebar_reopen(right_pane, sidebar_pane, sidebar_cmd, width)
@@ -2305,6 +2576,7 @@ def command_tmux(args: argparse.Namespace) -> int:
         args.codex_args,
         args.claude_bin,
         width,
+        args.all,
     )
     install_tmux_help_key(providers)
     install_tmux_status_hint(providers, qgenie_bin=qgenie_bin, script_path=script)
@@ -2364,7 +2636,7 @@ def box_content(text: str, width: int) -> str:
 
 
 def prompt_context_lines(session: Session, width: int) -> list[str]:
-    text = normalize_ws(session.first_prompt or session.last_prompt or "")
+    text = normalize_ws(session.search_snippet or session.first_prompt or session.last_prompt or "")
     if not text:
         return ["context: -", "          "]
     inner_width = max(1, width - 4)
@@ -2393,7 +2665,7 @@ def sidebar_card_title(session: Session, width: int, selected: bool) -> str:
     if session.custom_title:
         title = "★ " + session.custom_title
     else:
-        title = session.native_title
+        title = session.native_title or session.title
     return f"─ {marker} {age} · {title} "
 
 
@@ -2552,7 +2824,7 @@ def send_resume_to_pane(
             return recovery_message
     prepare_pane_for_resume(target_pane, kill_running)
     subprocess.run(
-        ["tmux", "send-keys", "-t", target_pane, resume_shell_command(session, agent_bin, codex_args), "Enter"],
+        ["tmux", "send-keys", "-t", target_pane, resume_shell_command(session, agent_bin, codex_args, config), "Enter"],
         check=False,
     )
     subprocess.run(["tmux", "select-pane", "-t", target_pane], check=False)
@@ -2638,7 +2910,7 @@ def send_native_rename_to_pane(target_pane: str, title: str, submit: bool = True
 
 def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
     configs = build_configs(args)
-    providers = [config.provider for config in configs]
+    providers = unique_providers(config.provider for config in configs)
     agent_bins = {provider: agent_bin_for(args, provider) for provider in providers}
     codex_args = codex_args_for(args) if "codex" in providers else []
     curses.curs_set(0)
@@ -2660,7 +2932,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
     scan_paused = False
     while True:
         if needs_reload:
-            loader = SidebarIndexLoader(configs, query, include_generated=include_generated_sessions(args))
+            loader = SidebarIndexLoader(configs, query, include_generated=include_generated_for_sidebar(args, query))
             sessions = loader.load_more(0, limit=args.limit, path_budget=250)
             names_by_provider = loader.names_by_provider
             enriched_paths = set()
@@ -2675,7 +2947,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
                     session_name_key(sessions[selected].provider, sessions[selected].id) if sessions else ""
                 )
                 sessions.extend(added)
-                sessions.sort(key=lambda session: session.modified, reverse=True)
+                sort_sessions(sessions, query)
                 if selected_key:
                     selected = next(
                         (
@@ -2717,7 +2989,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
             absolute_index = start + offset
             path_key = str(session.path)
             if path_key not in enriched_paths:
-                config = config_for_provider(configs, session.provider)
+                config = config_for_session(configs, session)
                 parsed = parse_session(
                     session.path,
                     names_by_provider.get(session.provider, {}),
@@ -2781,7 +3053,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
         elif key in (10, 13):
             if sessions:
                 current = sessions[selected]
-                recovery_config = config_for_provider(configs, current.provider)
+                recovery_config = config_for_session(configs, current)
                 message = send_resume_to_pane(
                     args.target_pane,
                     current,
@@ -2809,7 +3081,7 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
                 current = sessions[selected]
                 value = prompt(stdscr, height - 1, "type DELETE to trash", "")
                 if value == "DELETE":
-                    config = config_for_provider(configs, current.provider)
+                    config = config_for_session(configs, current)
                     move_to_trash(config, current)
                     message = f"trashed {current.id[:12]}"
                     selected = max(0, selected - 1)
@@ -2924,6 +3196,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-attach", action="store_true", help="create detached and print attach command")
     p.add_argument("--new-session", action="store_true", help="force a new tmux session even inside tmux")
     p.add_argument("--dry-run", action="store_true", help="print tmux commands only")
+    p.add_argument("--all", action="store_true", help="include generated/background child sessions")
     p.add_argument("--codex-bin", default=default_codex_bin(), help="codex executable")
     p.add_argument(
         "--codex-args",
