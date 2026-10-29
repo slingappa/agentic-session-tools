@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 UUID_RE = re.compile(
@@ -102,6 +102,7 @@ class TmuxPane:
     session: str
     window: str
     attached: bool
+    socket: str = ""
 
 
 def eprint(*args: object) -> None:
@@ -1704,29 +1705,73 @@ def lock_holders(lock_path: Path, session_id: str) -> list[ProcessInfo]:
     return holders
 
 
+def current_tmux_socket() -> str:
+    value = os.environ.get("TMUX", "")
+    return value.split(",", 1)[0] if value else ""
+
+
+def tmux_socket_candidates() -> list[str]:
+    candidates: list[str] = []
+
+    def add(path: str | Path) -> None:
+        text = str(path)
+        if not text or text in candidates:
+            return
+        try:
+            if not Path(text).is_socket():
+                return
+        except OSError:
+            return
+        candidates.append(text)
+
+    add(current_tmux_socket())
+    socket_dir = Path("/tmp") / f"tmux-{os.getuid()}"
+    add(socket_dir / "default")
+    try:
+        for path in sorted(socket_dir.glob("server-*.sock")):
+            add(path)
+    except OSError:
+        pass
+    return candidates
+
+
+def tmux_command(socket: str, args: Sequence[str]) -> list[str]:
+    return ["tmux", "-S", socket, *args] if socket else ["tmux", *args]
+
+
 def tmux_panes() -> list[TmuxPane]:
     format_string = "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{session_name}\t#{window_index}\t#{session_attached}"
-    try:
-        result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", format_string],
-            text=True,
-            check=False,
-            capture_output=True,
-        )
-    except OSError:
-        return []
-    if result.returncode:
-        return []
     panes: list[TmuxPane] = []
-    for line in result.stdout.splitlines():
-        fields = line.split("\t")
-        if len(fields) != 6:
-            continue
+    sockets = tmux_socket_candidates()
+    commands = [(socket, tmux_command(socket, ["list-panes", "-a", "-F", format_string])) for socket in sockets]
+    if not commands:
+        commands = [("", ["tmux", "list-panes", "-a", "-F", format_string])]
+    seen: set[tuple[str, str]] = set()
+    for socket, command in commands:
         try:
-            pane_pid = int(fields[1])
-        except ValueError:
+            result = subprocess.run(
+                command,
+                text=True,
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
             continue
-        panes.append(TmuxPane(fields[0], pane_pid, fields[2], fields[3], fields[4], fields[5] == "1"))
+        if result.returncode:
+            continue
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            key = (socket, fields[0])
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                pane_pid = int(fields[1])
+            except ValueError:
+                continue
+            panes.append(TmuxPane(fields[0], pane_pid, fields[2], fields[3], fields[4], fields[5] == "1", socket))
     return panes
 
 
@@ -1755,17 +1800,34 @@ def pane_for_process(info: ProcessInfo, panes: Sequence[TmuxPane] | None = None)
 
 def focus_tmux_pane(pane: TmuxPane) -> bool:
     target = f"{pane.session}:{pane.window}"
-    if os.environ.get("TMUX"):
-        subprocess.run(["tmux", "switch-client", "-t", target], check=False)
-        subprocess.run(["tmux", "select-pane", "-t", pane.pane_id], check=False)
+    command = lambda args: tmux_command(pane.socket, args)
+    current_socket = current_tmux_socket()
+    if os.environ.get("TMUX") and (not pane.socket or pane.socket == current_socket):
+        subprocess.run(command(["switch-client", "-t", target]), check=False)
+        subprocess.run(command(["select-pane", "-t", pane.pane_id]), check=False)
         return True
-    result = subprocess.run(["tmux", "attach-session", "-t", pane.session], check=False)
+    if os.environ.get("TMUX") and pane.socket and pane.socket != current_socket:
+        attach_command = f"tmux -S {shell_quote(pane.socket)} attach -t {shell_quote(pane.session)}"
+        subprocess.run(["tmux", "display-message", f"existing session is on another tmux server: {attach_command}"], check=False)
+        return True
+    result = subprocess.run(command(["attach-session", "-t", pane.session]), check=False)
     return result.returncode == 0
 
 
 def foreground_stopped_process(pane: TmuxPane) -> None:
-    subprocess.run(["tmux", "send-keys", "-t", pane.pane_id, "fg", "Enter"], check=False)
-    subprocess.run(["tmux", "select-pane", "-t", pane.pane_id], check=False)
+    command = lambda args: tmux_command(pane.socket, args)
+    subprocess.run(command(["send-keys", "-t", pane.pane_id, "fg", "Enter"]), check=False)
+    subprocess.run(command(["select-pane", "-t", pane.pane_id]), check=False)
+
+
+def attach_tmux_session_to_pane(target_pane: str, pane: TmuxPane, suspend_running: bool) -> None:
+    if suspend_running:
+        subprocess.run(["tmux", "send-keys", "-t", target_pane, "C-z"], check=False)
+        time.sleep(0.35)
+    attach_command = f"tmux -S {shell_quote(pane.socket)} attach -t {shell_quote(pane.session)}"
+    subprocess.run(["tmux", "send-keys", "-t", target_pane, "-l", attach_command], check=False)
+    subprocess.run(["tmux", "send-keys", "-t", target_pane, "Enter"], check=False)
+    subprocess.run(["tmux", "select-pane", "-t", target_pane], check=False)
 
 
 def process_alive(pid: int) -> bool:
@@ -1825,11 +1887,43 @@ def stop_existing_session_processes(processes: Sequence[ProcessInfo], timeout: f
     return not any(process_alive(info.pid) for info in unique.values())
 
 
+def interrupt_process_group_for_lock(
+    owner: ProcessInfo,
+    lock_path: Path,
+    session_id: str,
+    timeout: float = 5.0,
+) -> bool:
+    """Send Ctrl-C semantics to the lock owner's process group.
+
+    This is intentionally gentler than ``stop_existing_session_processes``:
+    the tmux sidebar confirmation path should match a user pressing Ctrl-C in
+    the lost pane, then stop if the writer lock remains held.
+    """
+    if owner.pgid <= 1 or owner.pgid == os.getpgrp():
+        return False
+    if not any(holder.pgid == owner.pgid for holder in lock_holders(lock_path, session_id)):
+        return True
+    try:
+        os.killpg(owner.pgid, signal.SIGINT)
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(holder.pgid == owner.pgid for holder in lock_holders(lock_path, session_id)):
+            return True
+        time.sleep(0.1)
+    return not any(holder.pgid == owner.pgid for holder in lock_holders(lock_path, session_id))
+
+
 def recover_existing_session(
     session: Session,
     config: Config,
     *,
     allow_terminate: bool = True,
+    confirm_terminate: Callable[[ProcessInfo, Sequence[ProcessInfo], Path], bool] | None = None,
+    interrupt_group_only: bool = False,
+    reattach_target_pane: str = "",
+    suspend_reattach_target: bool = True,
 ) -> tuple[bool, str]:
     """Reuse an existing session process, or clear an unreachable owner.
 
@@ -1847,6 +1941,10 @@ def recover_existing_session(
     owner = holders[0]
     pane = pane_for_process(owner, panes)
     if pane:
+        current_socket = current_tmux_socket()
+        if pane.socket and os.environ.get("TMUX") and pane.socket != current_socket and reattach_target_pane:
+            attach_tmux_session_to_pane(reattach_target_pane, pane, suspend_reattach_target)
+            return True, f"attached existing {session.id[:12]} from tmux {pane.session}"
         if owner.state in {"T", "t"}:
             foreground_stopped_process(pane)
             focus_tmux_pane(pane)
@@ -1861,6 +1959,12 @@ def recover_existing_session(
     processes = [info for info in session_processes(session.id) if info.pgid == owner.pgid]
     if not processes:
         processes = [owner]
+    if confirm_terminate and not confirm_terminate(owner, processes, lock_path):
+        return True, f"left existing {session.id[:12]} running (pid {owner.pid}, tty {owner.tty})"
+    if interrupt_group_only:
+        if interrupt_process_group_for_lock(owner, lock_path, session.id):
+            return False, f"interrupted old process group {owner.pgid} for {session.id[:12]}"
+        return True, f"lock still held after SIGINT for {session.id[:12]} (pid {owner.pid}, pgid {owner.pgid})"
     if not stop_existing_session_processes(processes):
         return True, f"could not stop unreachable process for {session.id[:12]} (pid {owner.pid})"
     return False, f"cleared unreachable process for {session.id[:12]}"
@@ -1958,16 +2062,48 @@ def is_qgenie_bin(agent_bin: str) -> bool:
     return Path(agent_bin).name == "qgenie"
 
 
+QGENIE_WEBSOCKET_CONFIG = "model_providers.qgenie.supports_websockets=false"
+
+
+def has_codex_config(codex_args: Sequence[str], key: str) -> bool:
+    """Return whether Codex args explicitly configure a dotted key."""
+    for index, argument in enumerate(codex_args):
+        if argument in {"-c", "--config"} and index + 1 < len(codex_args):
+            value = codex_args[index + 1]
+            if value.split("=", 1)[0].strip() == key:
+                return True
+        elif argument.startswith("--config="):
+            if argument[len("--config=") :].split("=", 1)[0].strip() == key:
+                return True
+    return False
+
+
 def resume_commands(
     provider: str, agent_bin: str, session_id: str, codex_args: Sequence[str] = ()
 ) -> list[list[str]]:
     if is_qgenie_bin(agent_bin):
         if provider == "claude":
             return [[agent_bin, "claude", "--resume", session_id]]
-        return [
+        commands = [
             [agent_bin, "codex", *codex_args, "resume", session_id],
-            [agent_bin, "resume", session_id],
         ]
+        # Large resumed threads can exceed the QGenie websocket path. Keep the
+        # normal transport first, then retry with websockets disabled before
+        # falling back to the legacy qgenie command form.
+        if not has_codex_config(codex_args, "model_providers.qgenie.supports_websockets"):
+            commands.append(
+                [
+                    agent_bin,
+                    "codex",
+                    *codex_args,
+                    "-c",
+                    QGENIE_WEBSOCKET_CONFIG,
+                    "resume",
+                    session_id,
+                ]
+            )
+        commands.append([agent_bin, "resume", session_id])
+        return commands
     if provider == "claude":
         return [[agent_bin, "--resume", session_id]]
     return [[agent_bin, *codex_args, "resume", session_id]]
@@ -2798,6 +2934,31 @@ def prompt(stdscr: curses.window, row: int, label: str, initial: str = "") -> st
             pass
 
 
+def confirm_interrupt_lock_owner(
+    stdscr: curses.window,
+    row: int,
+    session: Session,
+    owner: ProcessInfo,
+    processes: Sequence[ProcessInfo],
+) -> bool:
+    _, width = stdscr.getmaxyx()
+    other_count = max(0, len({info.pid for info in processes}) - 1)
+    suffix = f", +{other_count} proc" if other_count else ""
+    message = (
+        f"Lock held by pid {owner.pid} pgid {owner.pgid} {owner.tty}{suffix}; "
+        f"send SIGINT? [y/N]"
+    )
+    stdscr.move(row, 0)
+    stdscr.clrtoeol()
+    stdscr.addnstr(row, 0, shorten(message, width - 1), width - 1)
+    stdscr.refresh()
+    try:
+        key = stdscr.getch()
+    except KeyboardInterrupt:
+        return False
+    return key in (ord("y"), ord("Y"))
+
+
 def prepare_pane_for_resume(target_pane: str, suspend_running: bool) -> None:
     if not suspend_running:
         return
@@ -2813,12 +2974,17 @@ def send_resume_to_pane(
     codex_args: Sequence[str] = (),
     config: Config | None = None,
     recover_existing: bool = True,
+    confirm_terminate: Callable[[ProcessInfo, Sequence[ProcessInfo], Path], bool] | None = None,
 ) -> str:
     if config is not None:
         handled, recovery_message = recover_existing_session(
             session,
             config,
             allow_terminate=kill_running and recover_existing,
+            confirm_terminate=confirm_terminate,
+            interrupt_group_only=confirm_terminate is not None,
+            reattach_target_pane=target_pane,
+            suspend_reattach_target=kill_running,
         )
         if handled:
             return recovery_message
@@ -3062,6 +3228,13 @@ def sidebar_curses(stdscr: curses.window, args: argparse.Namespace) -> int:
                     codex_args,
                     recovery_config,
                     not args.no_recover_existing,
+                    lambda owner, processes, _lock_path, selected=current: confirm_interrupt_lock_owner(
+                        stdscr,
+                        height - 1,
+                        selected,
+                        owner,
+                        processes,
+                    ),
                 )
                 active_key = active_session_key(current)
         elif key == ord("r"):

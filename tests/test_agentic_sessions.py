@@ -538,6 +538,31 @@ class TmuxProbeTests(unittest.TestCase):
         self.assertTrue(available)
         self.assertEqual(run.call_args.args[0], ["tmux", "list-sessions"])
 
+    def test_tmux_panes_scans_recovered_socket_candidates(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="%7\t99\t/dev/pts/7\tagentic\t0\t1\n", stderr="")
+        with mock.patch.object(
+            agentic_sessions, "tmux_socket_candidates", return_value=["/tmp/tmux-1000/server-99.sock"]
+        ), mock.patch.object(agentic_sessions.subprocess, "run", return_value=completed) as run:
+            panes = agentic_sessions.tmux_panes()
+
+        self.assertEqual(len(panes), 1)
+        self.assertEqual(panes[0].socket, "/tmp/tmux-1000/server-99.sock")
+        self.assertEqual(run.call_args.args[0][:3], ["tmux", "-S", "/tmp/tmux-1000/server-99.sock"])
+
+    def test_attach_tmux_session_to_pane_sends_attach_command(self) -> None:
+        pane = agentic_sessions.TmuxPane(
+            "%7", 99, "/dev/pts/7", "agentic session", "0", True, "/tmp/tmux-1000/server-99.sock"
+        )
+        with mock.patch.object(agentic_sessions.time, "sleep"), mock.patch.object(
+            agentic_sessions.subprocess, "run"
+        ) as run:
+            agentic_sessions.attach_tmux_session_to_pane("%2", pane, suspend_running=True)
+
+        sent_commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(sent_commands[0], ["tmux", "send-keys", "-t", "%2", "C-z"])
+        self.assertIn("tmux -S '/tmp/tmux-1000/server-99.sock' attach -t 'agentic session'", sent_commands[1])
+        self.assertEqual(sent_commands[-1], ["tmux", "select-pane", "-t", "%2"])
+
 
 class ResumeCommandTests(unittest.TestCase):
     def make_session(self, session_id: str) -> agentic_sessions.Session:
@@ -599,6 +624,33 @@ class ResumeCommandTests(unittest.TestCase):
         self.assertIn("foregrounded existing", message)
         foreground.assert_called_once_with(pane)
 
+    def test_existing_process_in_foreign_tmux_server_is_attached_to_target_pane(self) -> None:
+        session_id = "11111111-2222-3333-4444-555555555555"
+        info = agentic_sessions.ProcessInfo(123, 1, 123, "/dev/pts/7", "S", ("codex", "resume", session_id))
+        pane = agentic_sessions.TmuxPane(
+            "%7", 99, "/dev/pts/7", "agentic", "0", True, "/tmp/tmux-1000/server-99.sock"
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            agentic_sessions.os.environ,
+            {"TMUX": "/tmp/tmux-1000/default,456,0"},
+            clear=False,
+        ), mock.patch.object(agentic_sessions, "lock_holders", return_value=[info]), mock.patch.object(
+            agentic_sessions, "tmux_panes", return_value=[pane]
+        ), mock.patch.object(agentic_sessions, "attach_tmux_session_to_pane") as attach, mock.patch.object(
+            agentic_sessions, "focus_tmux_pane"
+        ) as focus:
+            handled, message = agentic_sessions.recover_existing_session(
+                self.make_session(session_id),
+                self.make_config(Path(tmp)),
+                reattach_target_pane="%2",
+                suspend_reattach_target=True,
+            )
+
+        self.assertTrue(handled)
+        self.assertIn("attached existing", message)
+        attach.assert_called_once_with("%2", pane, True)
+        focus.assert_not_called()
+
     def test_unreachable_owner_is_cleared_before_new_resume(self) -> None:
         session_id = "11111111-2222-3333-4444-555555555555"
         info = agentic_sessions.ProcessInfo(123, 1, 123, "/dev/pts/7", "S", ("codex", "resume", session_id))
@@ -614,6 +666,63 @@ class ResumeCommandTests(unittest.TestCase):
         self.assertFalse(handled)
         self.assertIn("cleared unreachable", message)
         stop.assert_called_once_with([info])
+
+    def test_unreachable_owner_confirmation_decline_keeps_running(self) -> None:
+        session_id = "11111111-2222-3333-4444-555555555555"
+        info = agentic_sessions.ProcessInfo(123, 1, 456, "/dev/pts/7", "S", ("codex", "resume", session_id))
+        confirm = mock.Mock(return_value=False)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            agentic_sessions, "lock_holders", return_value=[info]
+        ), mock.patch.object(agentic_sessions, "tmux_panes", return_value=[]), mock.patch.object(
+            agentic_sessions, "session_processes", return_value=[info]
+        ), mock.patch.object(agentic_sessions, "interrupt_process_group_for_lock") as interrupt:
+            handled, message = agentic_sessions.recover_existing_session(
+                self.make_session(session_id),
+                self.make_config(Path(tmp)),
+                confirm_terminate=confirm,
+                interrupt_group_only=True,
+            )
+
+        self.assertTrue(handled)
+        self.assertIn("left existing", message)
+        confirm.assert_called_once()
+        interrupt.assert_not_called()
+
+    def test_unreachable_owner_confirmation_interrupts_process_group(self) -> None:
+        session_id = "11111111-2222-3333-4444-555555555555"
+        info = agentic_sessions.ProcessInfo(123, 1, 456, "/dev/pts/7", "S", ("codex", "resume", session_id))
+        confirm = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            agentic_sessions, "lock_holders", return_value=[info]
+        ), mock.patch.object(agentic_sessions, "tmux_panes", return_value=[]), mock.patch.object(
+            agentic_sessions, "session_processes", return_value=[info]
+        ), mock.patch.object(
+            agentic_sessions, "interrupt_process_group_for_lock", return_value=True
+        ) as interrupt, mock.patch.object(agentic_sessions, "stop_existing_session_processes") as stop:
+            handled, message = agentic_sessions.recover_existing_session(
+                self.make_session(session_id),
+                self.make_config(Path(tmp)),
+                confirm_terminate=confirm,
+                interrupt_group_only=True,
+            )
+
+        self.assertFalse(handled)
+        self.assertIn("interrupted old process group 456", message)
+        confirm.assert_called_once()
+        interrupt.assert_called_once()
+        stop.assert_not_called()
+
+    def test_process_group_interrupt_sends_sigint_and_waits_for_lock_release(self) -> None:
+        session_id = "11111111-2222-3333-4444-555555555555"
+        info = agentic_sessions.ProcessInfo(123, 1, 456, "/dev/pts/7", "S", ("codex", "resume", session_id))
+        lock_path = Path("/tmp") / f"{session_id}.lock"
+        with mock.patch.object(agentic_sessions.os, "getpgrp", return_value=999), mock.patch.object(
+            agentic_sessions.os, "killpg"
+        ) as killpg, mock.patch.object(agentic_sessions, "lock_holders", side_effect=[[info], []]):
+            released = agentic_sessions.interrupt_process_group_for_lock(info, lock_path, session_id)
+
+        self.assertTrue(released)
+        killpg.assert_called_once_with(456, agentic_sessions.signal.SIGINT)
 
     def test_codex_args_are_inserted_before_resume_for_qgenie(self) -> None:
         commands = agentic_sessions.resume_commands(
@@ -636,8 +745,32 @@ class ResumeCommandTests(unittest.TestCase):
         )
         self.assertEqual(
             commands[1],
+            [
+                "/usr2/slingapp/.local/bin/qgenie",
+                "codex",
+                "-s",
+                "danger-full-access",
+                "-c",
+                "model_providers.qgenie.supports_websockets=false",
+                "resume",
+                "01a03846-bb7b-7e02-a2ed-4fb31505afd3",
+            ],
+        )
+        self.assertEqual(
+            commands[2],
             ["/usr2/slingapp/.local/bin/qgenie", "resume", "01a03846-bb7b-7e02-a2ed-4fb31505afd3"],
         )
+
+    def test_qgenie_does_not_duplicate_explicit_websocket_config(self) -> None:
+        commands = agentic_sessions.resume_commands(
+            "codex",
+            "/usr2/slingapp/.local/bin/qgenie",
+            "01a03846-bb7b-7e02-a2ed-4fb31505afd3",
+            ["-c", "model_providers.qgenie.supports_websockets=false"],
+        )
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0][2:5], ["-c", "model_providers.qgenie.supports_websockets=false", "resume"])
 
     def test_codex_args_are_inserted_before_resume_for_codex(self) -> None:
         commands = agentic_sessions.resume_commands(
